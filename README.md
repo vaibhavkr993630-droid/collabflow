@@ -33,12 +33,27 @@ set custom headers on the handshake request. This means a short-lived access tok
 server access logs via the query string. A production system would issue a short-lived, single-use
 WS ticket via an authenticated REST call instead of reusing the access token here.
 
+## Notifications & background jobs
+
+In-app notifications (mentions, task assignments, workspace/project invites, due-soon reminders)
+are delivered live over `/ws/notifications` and persisted to the `notifications` table. Each one
+also queues a Celery task that sends an email — in local dev this goes to a MailDev container, not
+a real inbox, so nothing needs real SMTP credentials to test the full flow. View sent mail at
+`http://localhost:1080`. Celery Beat runs `send_due_soon_reminders` once daily (see
+`app/workers/celery_app.py`) for tasks due the next day.
+
+@mentions in comments use the mentioned user's **email** (e.g. `@alice@example.com`) — there's no
+separate username field on `User`, and email is the only identifier a mention can unambiguously
+resolve to one account. A mention only notifies if that email belongs to an actual member of the
+task's project; mentioning a non-member's email is a silent no-op (not an error) — see
+`app/services/comment_service.py`.
+
 ## Local development
 
-Requires Docker Desktop with WSL integration enabled (or a native Postgres instance).
+Requires Docker Desktop with WSL integration enabled (or native Postgres/Redis instances).
 
 ```bash
-docker compose up -d postgres redis minio
+docker compose up -d postgres redis minio maildev
 
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
@@ -50,6 +65,16 @@ uvicorn app.main:app --reload
 ```
 
 API docs at `http://localhost:8000/docs`. Health check at `/health`.
+
+### Running the background worker
+
+Needed for email sending and the due-soon reminder job — the API queues Celery tasks regardless
+of whether a worker is running, so nothing breaks without one, but nothing gets delivered either.
+
+```bash
+celery -A app.workers.celery_app worker --loglevel=info   # processes queued tasks
+celery -A app.workers.celery_app beat --loglevel=info      # schedules the daily reminder job
+```
 
 ### Running tests
 

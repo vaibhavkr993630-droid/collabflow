@@ -3,7 +3,78 @@
 Persistent memory for this project across sessions. Read this first before touching code.
 
 ## Current Phase
-**Phase 4 — Real-Time: complete and verified.**
+**Phase 5 — Notifications & Background Jobs: complete and verified.**
+
+## Status — Phase 5 (Notifications, Celery, Email, Reminders)
+- [x] `Notification` model (user_id, type, title, body, optional project_id/task_id both
+      `ON DELETE SET NULL` — same "history outlives the referenced entity" reasoning as
+      ActivityLog, see Phase 3/4), `read_at` nullable timestamp for read/unread state.
+- [x] `app/services/notification_service.create_and_dispatch` — the single choke point every
+      trigger calls through: persists + commits (its own unit of work, not bundled into the
+      caller's transaction — see Bugs/Decisions below for why), broadcasts live over
+      `/ws/notifications` via Redis pub/sub, and queues a Celery email task, always, regardless
+      of whether the recipient is currently connected.
+- [x] Real-time delivery generalized from Phase 4's project-room pattern rather than duplicated:
+      `app/ws/redis_listener.py`'s `run_pattern_listener` is now generic (pattern + id-extractor +
+      deliver-fn), so `main.py`'s lifespan runs two instances of the same listener — one for
+      `project:*:events` (existing), one for `user:*:notifications` (new) — instead of two
+      different pieces of listener code. `app/ws/notification_manager.py` mirrors
+      `connection_manager.py`'s shape but keyed only by user_id (notifications aren't
+      project-scoped — a user should be notified even for a project they don't have open).
+- [x] `GET /ws/notifications` (WebSocket, any authenticated user, no project check) and REST:
+      `GET /api/notifications` (paginated), `GET /api/notifications/unread-count`,
+      `POST /api/notifications/{id}/read`, `POST /api/notifications/read-all`.
+- [x] Notification triggers wired into existing services rather than added as new endpoints:
+      task assignment (create + reassignment, not self-assignment) in `task_service`, workspace
+      invite in `workspace_service`, project invite in `project_service`, @mention parsing in
+      `comment_service` (email-based mentions, `app/core/mentions.py`; only notifies if the
+      mentioned email belongs to an actual project member — see README).
+- [x] Celery app (`app/workers/celery_app.py`, Redis as broker+backend) + `send_notification_email`
+      task (blocking `smtplib`, fine since it only ever runs on a Celery worker thread, not the
+      API's event loop) + Celery Beat `send_due_soon_reminders`, scheduled daily, matching tasks
+      due **exactly tomorrow** (not "due within N days" — see Decisions below for why that
+      distinction matters).
+- [x] MailDev container added to `docker-compose.yml` (pinned to `2.1.0`, not `latest` — see Bugs
+      below) for real SMTP delivery in local dev without needing real credentials; viewable at
+      `http://localhost:1080`.
+- [x] pytest suite: +12 tests (53 total) covering every notification trigger, unread count,
+      mark-read/mark-all-read, cross-user access denial (404, not 403 — don't reveal another
+      user's notification exists), and live WS delivery.
+- [x] ruff clean. Alembic migration applied to real Postgres. Extensive live verification: full
+      HTTP smoke test of every trigger, a real Celery worker actually processing the queued-task
+      backlog from earlier test runs and delivering real mail to MailDev (confirmed via MailDev's
+      own API, not just "the task didn't raise"), and the Beat reminder job run synchronously
+      against a real task due tomorrow — notification created, email queued, delivered, confirmed
+      in MailDev.
+
+## Decisions worth knowing for Phase 5
+- **Why the due-soon reminder matches `due_date == tomorrow` exactly, not "due within N days":**
+  the job runs once daily. An exact-date match fires once per task, the day before it's due.
+  A range match (e.g. "due within 2 days") would re-notify the same still-open, still-overdue task
+  every single day the job runs until it's marked done — a design that looks more thorough but is
+  actually just a spam generator. The tradeoff: a task whose due date passes without the job
+  running that specific day (downtime) never gets reminded. Accepted for scope; noted honestly.
+- **Why `create_and_dispatch` commits on its own, not inside the caller's transaction:** a single
+  comment can mention multiple project members, meaning one `create_comment` call may invoke
+  `create_and_dispatch` several times — each needs to succeed or fail independently, not roll back
+  the others (or the comment itself) if one recipient lookup has an issue. Same reasoning as the
+  WS broadcast-after-commit pattern from Phase 4, applied one layer further.
+- **Test-writing lesson, not a code bug, but worth recording:** several new notification tests
+  initially asserted the wrong count (e.g. expecting 1 notification after an assignment, got 2)
+  because inviting a user to a project *also* creates a `project_invite` notification for that
+  same user — both fire for the same recipient in tests that invite-then-assign in one flow. The
+  app behavior was correct throughout; the tests had to be corrected to account for it. A reminder
+  that "the test failed" and "the code is wrong" are different claims — this session's assertions
+  were checked against actual behavior before being changed, not just adjusted to whatever passed.
+
+## Bugs found and fixed in Phase 5
+1. **MailDev `:latest` tag pulled a release candidate (3.0.0-rc.3) with a different, API-only
+   routing scheme** — the web UI and `/email` endpoint both 404'd even though the SMTP server and
+   process were genuinely up and healthy (confirmed via `docker logs` and `netstat` inside the
+   container before concluding this wasn't a startup timing issue). Pinning to `2.1.0` (a known
+   stable release) fixed it immediately. Lesson: `:latest` on a fast-moving dev-tool image is a
+   real risk, not just a hygiene nitpick — caught here because I verified the container's actual
+   listening state before assuming misconfiguration on my end.
 
 ## Status — Phase 4 (WebSockets, Redis Pub/Sub, Presence)
 - [x] `app/ws/connection_manager.py` — process-local registry of live WebSocket connections,
@@ -224,9 +295,10 @@ their labels — a deliberate `selectinload`-equivalent choice, not an accident.
 
 ## Deviations from Brief
 - `docker-compose.yml` introduced early (Phase 1, infra-only) rather than Phase 8 — see Key Decisions.
-- Mention parsing (brief lists "comments, mentions" together under Task fields in Phase 2) is
+- Mention parsing (brief lists "comments, mentions" together under Task fields in Phase 2) was
   deferred to Phase 5, when the notification system that would consume mentions actually exists.
-  Comments themselves are built now. Confirmed with user before proceeding.
+  Comments themselves were built in Phase 2. Confirmed with user before proceeding. **Resolved in
+  Phase 5** — see that phase's status section for the implementation.
 
 ## Local dev environment notes
 - Docker Desktop WSL integration must be enabled for the Ubuntu-24.04 distro (it was off at the
@@ -236,15 +308,18 @@ their labels — a deliberate `selectinload`-equivalent choice, not an accident.
   -c "CREATE DATABASE collabflow_test;"`.
 
 ## Next Steps
-Phase 4 is done and verified. Next: Phase 5 (Notifications & Background Jobs — Notification model
-+ in-app delivery over WebSocket reusing the Phase 4 connection manager, Celery worker setup,
-email sending for key events, Celery Beat for a reminder job). This is also where deferred mention
-parsing from Phase 2 finally gets a consumer — see Phase 2's Deviations entry.
+Phase 5 is done and verified — including closing out Phase 2's deferred mention-parsing item (see
+that phase's Deviations entry; it now has a real consumer). Next: Phase 6 (Files — MinIO
+integration, attachment upload/validation on tasks, file metadata in DB). MinIO is already in
+`docker-compose.yml` from Phase 1 but has never actually been used yet — Phase 6 is where that
+gets exercised for the first time.
 
 ## Model Effort Reminder
-Per the brief: stay at Medium effort for routine CRUD/auth work. Phase 4 (Real-Time) was done at
-High effort per the brief's instruction — genuinely harder architectural reasoning, and it caught
-real concurrency bugs (see Phase 4's bug list) that Medium-effort review likely would have missed.
-**Drop back to Medium for Phase 5** — Celery/email/notification-model work is routine CRUD-shaped,
-not the kind of design problem that justifies staying at High. Flag again if Phase 5 hits a
-non-trivial async/Celery edge case worth bumping back up for.
+Per the brief: stay at Medium effort for routine CRUD/auth work; bump to High only for genuinely
+harder design problems. Phase 4 (Real-Time) was done at High and caught real concurrency bugs that
+Medium-effort review likely would have missed. Phase 5 (Notifications/Celery) was done at Medium,
+appropriately — it was CRUD-shaped work (a new model, triggers wired into existing services,
+standard Celery setup) with no comparable architectural complexity; the one interesting design
+decision (exact-date reminder matching, not a range) was a judgment call, not a hard problem.
+**Stay at Medium for Phase 6** (Files/MinIO) unless something in that phase's design turns out to
+be less routine than it looks — flag it if so.
