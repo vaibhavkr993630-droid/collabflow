@@ -8,6 +8,7 @@ from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 from app.core.redis import close_redis_client
+from app.core.storage import ensure_bucket_exists
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
@@ -20,6 +21,20 @@ settings = get_settings()
 # connection per checkout instead of reusing one across tests.
 engine = create_async_engine(settings.test_database_url, future=True, poolclass=NullPool)
 TestSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_bucket() -> None:
+    """
+    In normal (non-test) operation, main.py's lifespan calls this on startup —
+    but tests/conftest.py's `client` fixture builds an ASGITransport-backed
+    AsyncClient directly, which never triggers the app's lifespan (`ws_client`'s
+    TestClient does, but attachment tests don't depend on that ordering). This
+    was silently masked locally by an already-provisioned bucket from earlier
+    manual testing; a fresh MinIO instance (a clean CI run) has no bucket at
+    all, and every attachment test failed with NoSuchBucket until this was added.
+    """
+    ensure_bucket_exists()
 
 
 @pytest.fixture(autouse=True)
