@@ -18,6 +18,7 @@ dependencies = [
     "redis>=5.2",
     "celery>=5.4",
     "boto3>=1.35",
+    "sentry-sdk[fastapi]>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +31,9 @@ dev = [
     "ruff>=0.7",
     "websockets>=13",  # standalone client used in manual smoke-test scripts, not the pytest suite
 ]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
