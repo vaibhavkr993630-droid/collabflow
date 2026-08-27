@@ -3,7 +3,80 @@
 Persistent memory for this project across sessions. Read this first before touching code.
 
 ## Current Phase
-**Phase 5 — Notifications & Background Jobs: complete and verified.**
+**Phase 6 — Files: complete and verified.**
+
+## Status — Phase 6 (MinIO Integration, Attachments)
+- [x] `Attachment` model: task_id (`ON DELETE CASCADE`, unlike ActivityLog/Notification's
+      `SET NULL` — an attachment has no meaning independent of its task; it's the actual file, not
+      a record *about* something), uploaded_by_id, filename, content_type, size_bytes, storage_key
+      (unique object key in the bucket).
+- [x] `app/core/storage.py` — boto3 S3 client wrapper (singleton, same pattern as
+      `get_redis_client`), targeting MinIO locally via `S3_ENDPOINT_URL`. Bucket auto-created
+      (idempotent) on app startup via `ensure_bucket_exists()` in `main.py`'s lifespan.
+      `build_storage_key` strips path components from the client-supplied filename and prefixes
+      with a fresh UUID — collision-proof and closes off using a crafted filename to escape the
+      task's key prefix.
+- [x] `POST /api/tasks/{task_id}/attachments` (multipart upload, Member+), `GET .../attachments`
+      (list, Member+), `GET .../attachments/{id}/download` (returns a **presigned URL**, not a
+      proxied file stream — the client downloads directly from MinIO, the API server never touches
+      the file bytes on the way out), `DELETE .../attachments/{id}` (Admin+, matching task
+      deletion's existing Admin+ restriction rather than adding an "or uploader" ownership carve-out
+      — see Decisions below).
+- [x] Validation: empty files and files over `MAX_ATTACHMENT_SIZE_MB` (default 10MB) rejected with
+      400. Deliberately did *not* add content-type allow/deny-listing — see Known Simplifications.
+- [x] Deleting a task now cleans up its attachments' actual S3 objects, not just the DB rows: the
+      FK cascade handles the metadata automatically, but MinIO doesn't know about that cascade, so
+      `task_service.delete_task` fetches and deletes each attachment's object *before* the task row
+      (and its cascading attachment rows) are deleted — the storage_keys have to still exist to
+      read at that point.
+- [x] Activity log gets two new actions (`attachment_added`/`attachment_removed`) and WebSocket
+      gets two new broadcast event types, following the exact patterns established in Phase 3/4 —
+      no new architecture, just extending the existing ones to a new entity type.
+- [x] MailDev pattern repeated: MinIO already existed in `docker-compose.yml` since Phase 1 but was
+      never actually exercised until now.
+- [x] pytest suite: +9 tests (62 total) — upload/list, empty/oversized rejection, RBAC, presigned
+      URL shape, delete-removes-object-from-storage (verified via a real `head_object` call against
+      MinIO, not just "the endpoint returned 204"), and task-deletion cascade cleanup.
+- [x] ruff clean. Alembic migration applied to real Postgres (new table + two new enum values via
+      `ALTER TYPE ... ADD VALUE`, confirmed to work fine combined with `create_table` in the same
+      transaction on Postgres 16). Live HTTP smoke test: uploaded a real file, fetched a presigned
+      URL, downloaded through it, and **diffed the downloaded bytes against the original** — not
+      just "got a URL back," actual round-trip content verification.
+
+## Decisions worth knowing for Phase 6
+- **Why delete is Admin+ only, not "uploader or Admin+":** every other destructive action in this
+  app (task delete, member removal) is a role-gated action, not an ownership-gated one — there's no
+  precedent anywhere else for "you can delete your own X." Adding one just for attachments would be
+  an inconsistent, one-off RBAC shape for a marginal UX gain. Kept consistent with the rest of the
+  app's authorization model instead.
+- **Why the S3 object is deleted *before* the DB attachment row (upload) but *after* the DB
+  attachment row (delete):** on upload, if the S3 write failed there'd be nothing to roll back — a
+  DB row written first would point at a file that doesn't exist. On delete, the metadata row is the
+  thing users see gone; if MinIO happens to be briefly unreachable, deleting the row first and the
+  object afterward means the delete request still succeeds instead of failing on an
+  infrastructure hiccup, at the cost of a possible orphaned object if the second step never runs —
+  a tradeoff, not an oversight, and noted rather than silently accepted.
+
+## Known Simplifications (Phase 6)
+- No content-type allow/deny-list on uploads (any file type is accepted, subject only to the size
+  limit). MinIO/S3 never executes stored objects, so this isn't a code-execution risk the way an
+  upload-and-serve-from-app-server design would be — the main real-world gap is not blocking
+  obviously wrong types (e.g. `.exe`) at the API layer for UX reasons. Deferred as out of scope.
+- Presigned URLs default to a 5-minute expiry, not configurable per-request. Fine for this
+  project's scope; a production system might want shorter-lived URLs for sensitive attachments.
+
+## Bugs found and fixed in Phase 6
+1. **boto3 hung indefinitely (30s+) on every S3 call** — `ensure_bucket_exists()`, uploads, the
+   works — with zero error output, discovered by running a plain, isolated three-line script
+   outside pytest/the app entirely after a full pytest run timed out with no useful output.
+   Root cause: no `region_name` was passed to `boto3.client()`, so boto3 tried to resolve one via
+   the EC2 instance metadata service (`169.254.169.254`) before giving up — a lookup that hangs
+   rather than fails fast in any non-EC2 environment, which is every environment this project runs
+   in (local dev, CI, this session's sandbox). `curl` to MinIO's own health endpoint succeeded
+   throughout, which is what pointed at boto3's client construction rather than MinIO itself as the
+   actual problem. Fixed with an explicit (arbitrary, MinIO ignores it) `region_name="us-east-1"`.
+   Classic non-AWS-boto3 gotcha, worth remembering: **if boto3 hangs rather than errors, suspect
+   region auto-detection before anything else.**
 
 ## Status — Phase 5 (Notifications, Celery, Email, Reminders)
 - [x] `Notification` model (user_id, type, title, body, optional project_id/task_id both
@@ -308,18 +381,19 @@ their labels — a deliberate `selectinload`-equivalent choice, not an accident.
   -c "CREATE DATABASE collabflow_test;"`.
 
 ## Next Steps
-Phase 5 is done and verified — including closing out Phase 2's deferred mention-parsing item (see
-that phase's Deviations entry; it now has a real consumer). Next: Phase 6 (Files — MinIO
-integration, attachment upload/validation on tasks, file metadata in DB). MinIO is already in
-`docker-compose.yml` from Phase 1 but has never actually been used yet — Phase 6 is where that
-gets exercised for the first time.
+Phase 6 is done and verified. Backend feature work per the brief's phase list is now complete
+through Phase 6. Next: Phase 7 (Frontend Build-Out — can start in parallel once Phase 2's API is
+stable, which it has been for a while; React + TypeScript, Kanban board, task detail panel,
+comments, notifications panel, WebSocket integration, protected routes) or Phase 8 (Hardening —
+Docker Compose for the full stack including the backend/worker/frontend services still missing
+from `docker-compose.yml`, GitHub Actions CI, structured logging, Sentry, expanded test coverage).
+Ask the user which they want to tackle first — the brief allows either order.
 
 ## Model Effort Reminder
 Per the brief: stay at Medium effort for routine CRUD/auth work; bump to High only for genuinely
 harder design problems. Phase 4 (Real-Time) was done at High and caught real concurrency bugs that
-Medium-effort review likely would have missed. Phase 5 (Notifications/Celery) was done at Medium,
-appropriately — it was CRUD-shaped work (a new model, triggers wired into existing services,
-standard Celery setup) with no comparable architectural complexity; the one interesting design
-decision (exact-date reminder matching, not a range) was a judgment call, not a hard problem.
-**Stay at Medium for Phase 6** (Files/MinIO) unless something in that phase's design turns out to
-be less routine than it looks — flag it if so.
+Medium-effort review likely would have missed. Phases 5 and 6 were both done at Medium,
+appropriately — CRUD-shaped work (new models, triggers/endpoints wired into existing patterns, a
+standard Celery setup, a standard S3-client wrapper) with no comparable architectural complexity.
+**Stay at Medium for Phase 7/8** unless the frontend's WebSocket integration or reconnect/backoff
+logic turns out to be a harder design problem than it looks — flag it if so.

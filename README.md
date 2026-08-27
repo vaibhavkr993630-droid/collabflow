@@ -48,6 +48,19 @@ resolve to one account. A mention only notifies if that email belongs to an actu
 task's project; mentioning a non-member's email is a silent no-op (not an error) — see
 `app/services/comment_service.py`.
 
+## File attachments
+
+Tasks can have file attachments, stored in MinIO (S3-compatible) rather than the app server's own
+disk — the API server never proxies file bytes on download. Upload goes through the API
+(`POST /api/tasks/{task_id}/attachments`, multipart), but download returns a **presigned URL**
+(`GET .../attachments/{id}/download`) that the client fetches directly from MinIO, valid for 5
+minutes. Files are capped at `MAX_ATTACHMENT_SIZE_MB` (10MB by default); there's no content-type
+restriction beyond that — MinIO never executes stored objects, so this isn't a code-execution
+surface the way serving uploads back through the app server would be.
+
+MinIO's own console is at `http://localhost:9001` (login: the `S3_ACCESS_KEY`/`S3_SECRET_KEY`
+values in `.env`) if you want to browse the bucket directly.
+
 ## Local development
 
 Requires Docker Desktop with WSL integration enabled (or native Postgres/Redis instances).
