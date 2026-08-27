@@ -5,25 +5,27 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from app.models.roles import Role
 
 
-class WorkspaceCreate(BaseModel):
+class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=5000)
 
 
-class WorkspaceRead(BaseModel):
+class ProjectRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     name: str
     slug: str
-    organization_id: uuid.UUID
+    description: str | None
+    workspace_id: uuid.UUID
 
 
-class WorkspaceMemberInvite(BaseModel):
+class ProjectMemberInvite(BaseModel):
     email: EmailStr
     role: Role = Role.MEMBER
 
 
-class WorkspaceMemberRead(BaseModel):
+class ProjectMemberRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
