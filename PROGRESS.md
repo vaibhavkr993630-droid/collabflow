@@ -3,7 +3,89 @@
 Persistent memory for this project across sessions. Read this first before touching code.
 
 ## Current Phase
-**Phase 6 — Files: complete and verified.**
+**Phase 8 — Hardening (partial): CI, structured logging, Sentry, full Docker Compose stack —
+complete and verified. Not yet done: Phase 7 (frontend) hasn't started; expanded test coverage
+beyond what already existed wasn't a focus this pass.**
+
+## Status — Phase 8 (Hardening, partial pass)
+Picked ahead of Phase 7 deliberately: 34 commits of working backend with zero CI was the bigger
+gap for a repo a hiring engineer opens cold, and CI locks in every lesson learned in Phases 1-6
+before more code piles on top.
+
+- [x] `.github/workflows/backend-ci.yml` — lint (ruff) + `alembic upgrade head` against a real
+      Postgres service container + full pytest run, on every push/PR touching `backend/**`.
+      Postgres and Redis run as proper GitHub Actions `services:` containers; MinIO does **not** —
+      service containers can't override the image's command, and the official `minio/minio` image
+      needs `server /data` as an argument to actually start (its bare default CMD just prints
+      usage and exits). Started manually instead via a `docker run` step, using the exact command
+      already proven to work in this project's own `docker-compose.yml`.
+- [x] `app/core/logging_config.py` — stdlib-only JSON formatter (no external logging library),
+      wired into both the API process (`main.py`) and the Celery worker (via Celery's
+      `after_setup_logger`/`after_setup_task_logger` signals — Celery hijacks the root logger on
+      its own on worker startup, so `setup_logging()`'s normal approach gets silently overwritten
+      there; these signals are Celery's documented hook for this instead).
+- [x] Optional Sentry (`sentry-sdk[fastapi]`) — fully inert unless `SENTRY_DSN` is set, so it never
+      requires the user to have an account just for the app to keep working.
+- [x] `/health` now actually checks DB (`SELECT 1`) and Redis (`PING`) connectivity and returns 503
+      naming which dependency failed, rather than just confirming the process is alive. Verified
+      live: stopped the Redis container, confirmed `503 {"failed":["redis"]}`, restarted it,
+      confirmed `200` again.
+- [x] `backend/Dockerfile` + full `docker-compose.yml` (`backend`, `worker`, `beat` services, plus
+      a one-shot `migrate` service the other three `depends_on: condition: service_completed_successfully`
+      rather than each racing schema setup against their own first request/task). Frontend service
+      still absent — nothing to containerize yet.
+- [x] Verified for real, not just "it built": `docker compose up -d` brought up all 7 services
+      healthy; the worker container actually drained the entire backlog of `send_notification_email`
+      tasks queued by this whole session's earlier testing (proving Celery→Redis broker and
+      worker→MailDev SMTP both work by Docker service name, not just localhost); a full attachment
+      upload → presigned-URL → download → byte-diff round-trip through the fully containerized
+      stack matched exactly.
+- [x] Fixed an unrelated `setuptools` package-discovery break ("Multiple top-level packages
+      discovered: ['app', 'migrations']") that surfaced installing the new Sentry dependency — a
+      newer `setuptools` refuses to guess between them without explicit config. Added
+      `[tool.setuptools.packages.find] include = ["app*"]`.
+- [x] Full local pytest suite (62 tests) reran clean after all of the above; `ruff` clean.
+
+## Bugs found and fixed in this Phase 8 pass (three, all only visible with real infra)
+1. **`settings.debug=True` flooded stdout with hundreds of botocore internal DEBUG lines**,
+   burying real application/startup logs. Root cause: the root logger's level controlled *every*
+   library's verbosity, not just this app's own `log.debug()` calls. Fixed by keeping root at INFO
+   always and opting into DEBUG per-logger (`logging.getLogger("app").setLevel(DEBUG)`) instead —
+   every module logger in this codebase is already created via `logging.getLogger(__name__)`
+   under the `app.*` hierarchy, so this covers all of them without touching third-party loggers.
+2. **Every SQL log line was printed twice, once plain-text and once as JSON.** Root cause:
+   `create_async_engine(..., echo=settings.debug)` in `app/db/session.py` — SQLAlchemy's
+   `echo=True` attaches its *own* handler to the `sqlalchemy.engine` logger in addition to that
+   logger propagating to root (which now has the JSON handler from #1's fix), so both fired for
+   every line. Fixed by setting `echo=False` unconditionally; SQL logging, if ever wanted locally,
+   goes through the standard `logging.getLogger("sqlalchemy.engine").setLevel(...)` mechanism
+   instead, which flows through the single JSON handler cleanly.
+3. **The interesting one: presigned attachment-download URLs were unusable outside the Docker
+   network.** `S3_ENDPOINT_URL=http://minio:9000` (the internal Compose service name) is correct
+   for the backend's own I/O calls but got baked into the presigned URL's *host* too — since AWS
+   SigV4 signing includes the host as part of what's signed, generating the URL with the internal
+   client meant an external caller (a browser, curl from the host machine) got back a URL that
+   only resolves inside the Compose network. Caught by an actual end-to-end round-trip test
+   through the full containerized stack (`curl` the presigned URL, diff the downloaded bytes) —
+   would **not** have been caught by any unit-level check on the URL's shape, since the URL is
+   syntactically valid either way; only trying to actually reach it from outside the network
+   reveals the problem. Fixed with a second boto3 client (`get_presign_client` in
+   `app/core/storage.py`) built against a separate `S3_PUBLIC_ENDPOINT_URL` setting, used only for
+   signing — every actual I/O call (`put`/`get`/`delete`/`head`) still goes through the original
+   internal-endpoint client. `docker-compose.yml` sets `S3_PUBLIC_ENDPOINT_URL=http://localhost:9000`
+   for exactly this reason; local dev without Docker leaves it unset, where both endpoints are
+   already `localhost:9000` and the distinction is moot.
+
+## Known Simplifications (Phase 8)
+- Docker Desktop's WSL integration dropped mid-session more than once while doing this phase's
+  work (unrelated to anything in this repo — a host-machine Docker Desktop stability issue, not a
+  project bug). Worth remembering if a future session finds `docker` unreachable: check
+  `wsl.exe -l -v` for `docker-desktop` state before assuming something in the project broke.
+- CI doesn't yet build/push the Docker image anywhere (no registry configured) — it only lints,
+  migrates, and tests. Image publishing would be a reasonable next addition if this ever needs to
+  actually deploy from CI rather than just gate merges.
+- No frontend service in `docker-compose.yml` yet — Phase 7 hasn't started, so there's nothing to
+  containerize.
 
 ## Status — Phase 6 (MinIO Integration, Attachments)
 - [x] `Attachment` model: task_id (`ON DELETE CASCADE`, unlike ActivityLog/Notification's
@@ -381,19 +463,22 @@ their labels — a deliberate `selectinload`-equivalent choice, not an accident.
   -c "CREATE DATABASE collabflow_test;"`.
 
 ## Next Steps
-Phase 6 is done and verified. Backend feature work per the brief's phase list is now complete
-through Phase 6. Next: Phase 7 (Frontend Build-Out — can start in parallel once Phase 2's API is
-stable, which it has been for a while; React + TypeScript, Kanban board, task detail panel,
-comments, notifications panel, WebSocket integration, protected routes) or Phase 8 (Hardening —
-Docker Compose for the full stack including the backend/worker/frontend services still missing
-from `docker-compose.yml`, GitHub Actions CI, structured logging, Sentry, expanded test coverage).
-Ask the user which they want to tackle first — the brief allows either order.
+This Phase 8 pass is done and verified (CI, structured logging, Sentry, full Docker Compose
+stack). Remaining Phase 8 scope not yet touched: expanded test coverage beyond what already
+existed, and CI doesn't publish the Docker image anywhere. Next big piece: **Phase 7 (Frontend
+Build-Out)** — React + TypeScript, Kanban board, task detail panel, comments, notifications panel,
+WebSocket integration (with a reconnect/backoff wrapper — genuinely nontrivial, see Model Effort
+Reminder), protected routes. The backend API has been stable enough to build against since Phase 2.
 
 ## Model Effort Reminder
 Per the brief: stay at Medium effort for routine CRUD/auth work; bump to High only for genuinely
 harder design problems. Phase 4 (Real-Time) was done at High and caught real concurrency bugs that
-Medium-effort review likely would have missed. Phases 5 and 6 were both done at Medium,
-appropriately — CRUD-shaped work (new models, triggers/endpoints wired into existing patterns, a
-standard Celery setup, a standard S3-client wrapper) with no comparable architectural complexity.
-**Stay at Medium for Phase 7/8** unless the frontend's WebSocket integration or reconnect/backoff
-logic turns out to be a harder design problem than it looks — flag it if so.
+Medium-effort review likely would have missed. Phases 5, 6, and this Phase 8 pass were all done at
+Medium, appropriately — CRUD-shaped or infra-wiring work (new models, a standard Celery setup, a
+standard S3-client wrapper, CI/logging/Docker config) with no comparable architectural complexity,
+even though this Phase 8 pass did catch three real bugs (see its bug list) — those were caught by
+actually running things against real infra, not by deeper reasoning about a hard design problem.
+**Bump to High when Phase 7's WebSocket client (reconnect/backoff logic, reconciling live events
+with React Query cache state) starts** — that's the one piece of frontend work with real
+architectural teeth, similar in kind to Phase 4's backend WebSocket work. Routine component/UI
+work in Phase 7 can stay at Medium.

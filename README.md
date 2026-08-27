@@ -1,5 +1,7 @@
 # CollabFlow
 
+[![Backend CI](https://github.com/vaibhavkr993630-droid/collabflow/actions/workflows/backend-ci.yml/badge.svg)](https://github.com/vaibhavkr993630-droid/collabflow/actions/workflows/backend-ci.yml)
+
 A real-time collaboration and project management platform — a focused hybrid of Jira
 (task/project management) and Slack (real-time updates). See [PROJECT_BRIEF2.md](PROJECT_BRIEF2.md)
 for full scope, and [PROGRESS.md](PROGRESS.md) for build status and decisions.
@@ -65,6 +67,21 @@ values in `.env`) if you want to browse the bucket directly.
 
 Requires Docker Desktop with WSL integration enabled (or native Postgres/Redis instances).
 
+Two ways to run this locally — pick whichever fits what you're doing:
+
+### Option A: full stack in Docker (fastest way to just run it)
+
+```bash
+docker compose up -d
+```
+
+Brings up everything — Postgres, Redis, MinIO, MailDev, the API, a Celery worker, and Celery Beat
+— building the backend image from `backend/Dockerfile`. A one-shot `migrate` service applies
+Alembic migrations before `backend`/`worker`/`beat` start (see `docker-compose.yml`'s `depends_on`
+chain). API at `http://localhost:8000/docs`.
+
+### Option B: infra in Docker, backend running locally (for active backend development)
+
 ```bash
 docker compose up -d postgres redis minio maildev
 
@@ -77,9 +94,10 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-API docs at `http://localhost:8000/docs`. Health check at `/health`.
+API docs at `http://localhost:8000/docs`. Health check at `/health` — checks DB and Redis
+connectivity, not just "is the process alive," and returns 503 if either is unreachable.
 
-### Running the background worker
+### Running the background worker (Option B only — Option A already runs these)
 
 Needed for email sending and the due-soon reminder job — the API queues Celery tasks regardless
 of whether a worker is running, so nothing breaks without one, but nothing gets delivered either.
