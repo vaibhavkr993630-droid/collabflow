@@ -3,7 +3,37 @@
 Persistent memory for this project across sessions. Read this first before touching code.
 
 ## Current Phase
-**Phase 2 — Core Domain: complete and verified.**
+**Phase 3 — Activity & Search: complete and verified.**
+
+## Status — Phase 3 (Activity Log, Filtering/Sorting/Pagination, Basic Search)
+- [x] `ActivityLog` model (append-only — never updated/deleted, only inserted from
+      `app/services/activity_service.py`). `activity_metadata` (not `metadata` — that name is
+      reserved by SQLAlchemy's declarative `Base.metadata`) is a JSONB column holding structured
+      details (e.g. `{"changes": {"status": {"old": "todo", "new": "in_progress"}}}`).
+- [x] `task_id` FK is `ON DELETE SET NULL`, not `CASCADE` or a plain restrictive FK — a task's
+      history must outlive the task itself. Verified via live smoke test: deleting a task nulls
+      `task_id` on *every* historical log entry that referenced it (create, updates, etc.), not
+      just the deletion entry — correct Postgres FK semantics, not a bug.
+- [x] Every state-changing service call now logs an activity entry in the *same* transaction as
+      the change it describes (flush, not commit — the log entry only persists if the action it
+      describes actually commits): project created, member invited, task created/updated/deleted,
+      comment added, label created.
+- [x] `GET /api/projects/{project_id}/activity` and `GET /api/tasks/{task_id}/activity` — both
+      paginated, newest first, RBAC via existing `require_project_role`/`require_task_project_role`.
+- [x] Task listing (`GET /api/projects/{project_id}/tasks`) now supports filtering (status,
+      priority, assignee_id, label_id), search (`search` — ILIKE on title; Postgres `tsvector` not
+      used, per brief's "only if needed"), sorting (any field, asc/desc — status/priority sort
+      correctly by severity because Postgres native enums order by their *definition* order, which
+      was deliberately chosen to match: todo<in_progress<in_review<done, low<medium<high<urgent),
+      and pagination (page/page_size, capped at 100). Response is now a `{items, total, page,
+      page_size}` envelope instead of a bare list — a breaking change to the Phase 2 contract,
+      done deliberately rather than bolting pagination on as a second endpoint.
+- [x] Added `TaskUpdate.label_ids` (full-replace semantics) — Phase 2 built labels but never
+      wired up attaching them to a task, which would have made the new `label_id` filter
+      untestable. Closed that gap now rather than leaving it as dead functionality.
+- [x] pytest suite: +9 tests (35 total). ruff clean. Alembic migration applied to real Postgres.
+      Full live-HTTP smoke test against the migrated DB (filter/search/sort/paginate/update/
+      delete/activity-log), including the FK SET NULL behavior above.
 
 ## Status — Phase 2 (Projects, Project Membership, Tasks, Labels, Subtasks, Comments)
 - [x] `Role` enum + `ROLE_RANK` moved to a shared `app/models/roles.py` (was `WorkspaceRole`,
@@ -99,6 +129,10 @@ their labels — a deliberate `selectinload`-equivalent choice, not an accident.
 ## Known Simplifications
 - Single-instance assumptions not yet relevant (no WebSockets/Redis pub/sub wired up yet — Phase 4).
 - No rate limiting on auth endpoints yet (register/login) — worth adding before any public deploy.
+- Task search is a plain `ILIKE` on title (no index beyond the default btree on title via no
+  explicit index — full scans fine at this data scale). Postgres `tsvector` + GIN index deferred
+  per the brief's "only if needed" — would matter once task counts got large or description
+  search/ranking were required.
 
 ## Deviations from Brief
 - `docker-compose.yml` introduced early (Phase 1, infra-only) rather than Phase 8 — see Key Decisions.
@@ -114,8 +148,10 @@ their labels — a deliberate `selectinload`-equivalent choice, not an accident.
   -c "CREATE DATABASE collabflow_test;"`.
 
 ## Next Steps
-Phase 2 is done and verified. Next: Phase 3 (Activity log, filtering/sorting/pagination on tasks,
-basic search).
+Phase 3 is done and verified. Next: Phase 4 (Real-Time — WebSocket connection manager, broadcast
+task/comment updates to project "rooms", presence, Redis pub/sub). **Remember to remind the user
+to switch from Medium to High effort before starting Phase 4's design work** (see Model Effort
+Reminder below) — this is exactly the kind of harder architectural reasoning the brief flags.
 
 ## Model Effort Reminder
 Per the brief: stay at Medium effort through Phase 1-3 (routine CRUD/auth work). When Phase 4
