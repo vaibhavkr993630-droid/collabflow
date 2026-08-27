@@ -3,9 +3,42 @@
 Persistent memory for this project across sessions. Read this first before touching code.
 
 ## Current Phase
-**Phase 1 — Foundation: complete and verified.**
+**Phase 2 — Core Domain: complete and verified.**
 
-## Status
+## Status — Phase 2 (Projects, Project Membership, Tasks, Labels, Subtasks, Comments)
+- [x] `Role` enum + `ROLE_RANK` moved to a shared `app/models/roles.py` (was `WorkspaceRole`,
+      workspace-only) since project membership reuses the same three roles. Postgres enum type
+      `workspace_role` renamed to `member_role` via migration to match.
+- [x] Project, ProjectMembership models — same Owner/Admin/Member pattern as Workspace.
+      Creating a project auto-seeds the creator as project Owner (mirrors org→workspace pattern).
+- [x] Task model: title, description, status (todo/in_progress/in_review/done), priority
+      (low/medium/high/urgent), assignee, due_date, self-referential `parent_task_id` for
+      subtasks, `position` (int, fractional-style ordering within a status column for future
+      Kanban drag-and-drop), indexed on `project_id`, `assignee_id`, `status`, `parent_task_id`.
+- [x] Label + `task_labels` many-to-many association table (unique per project by name).
+- [x] Comment model (task_id, author_id, body). **Mention parsing deferred to Phase 5** — no
+      notification system exists yet to feed (see Deviations).
+- [x] `require_project_role(min_role)` and `require_task_project_role(min_role)` RBAC
+      dependencies — the latter loads the task by `task_id`, checks role via *its* project, and
+      returns the loaded Task so route handlers don't re-fetch it.
+- [x] Endpoints: create/list projects (workspace-scoped), project members (list/invite),
+      create/list/get/update/delete tasks, list subtasks, create/list labels, create/list comments.
+- [x] pytest suite: +15 tests (26 total), covering RBAC on every write endpoint (member vs.
+      admin/owner), assignee-must-be-project-member validation, subtask-same-project validation,
+      duplicate label rejection.
+- [x] ruff clean; Alembic migration applied to real Postgres (enum rename + 6 new
+      tables/associations); full manual smoke test through live HTTP API against the migrated DB.
+
+### Bug found and fixed in Phase 2
+`Task.labels` (a lazy-loaded relationship) was accessed by Pydantic's response serialization
+*after* the request's async DB session context had already yielded control back — FastAPI/Pydantic
+don't await SQLAlchemy's lazy-load machinery, so this raised `MissingGreenlet`. **Only surfaced
+when actually calling the endpoint (pytest response-model validation caught it too, to its
+credit — this one wasn't hidden).** Fixed by setting `lazy="selectin"` on `Task.labels`, which
+also happens to solve the N+1 that would otherwise occur when listing all tasks in a project with
+their labels — a deliberate `selectinload`-equivalent choice, not an accident.
+
+## Status — Phase 1 (Foundation)
 - [x] Repo initialized (git init, backend/frontend directory skeleton)
 - [x] Backend layered structure (`app/api/routers`, `core`, `models`, `schemas`, `services`, `crud`, `ws`, `workers`, `db`)
 - [x] FastAPI app skeleton + config (pydantic-settings) + `/health`
@@ -69,6 +102,9 @@ Persistent memory for this project across sessions. Read this first before touch
 
 ## Deviations from Brief
 - `docker-compose.yml` introduced early (Phase 1, infra-only) rather than Phase 8 — see Key Decisions.
+- Mention parsing (brief lists "comments, mentions" together under Task fields in Phase 2) is
+  deferred to Phase 5, when the notification system that would consume mentions actually exists.
+  Comments themselves are built now. Confirmed with user before proceeding.
 
 ## Local dev environment notes
 - Docker Desktop WSL integration must be enabled for the Ubuntu-24.04 distro (it was off at the
@@ -78,9 +114,8 @@ Persistent memory for this project across sessions. Read this first before touch
   -c "CREATE DATABASE collabflow_test;"`.
 
 ## Next Steps
-Phase 1 is done and verified. Next: pause and walk the user through what was built and why (per
-the brief's "learning project" instruction) before starting Phase 2 (Projects, Project membership,
-Tasks, Labels, Subtasks, Comments — the largest phase).
+Phase 2 is done and verified. Next: Phase 3 (Activity log, filtering/sorting/pagination on tasks,
+basic search).
 
 ## Model Effort Reminder
 Per the brief: stay at Medium effort through Phase 1-3 (routine CRUD/auth work). When Phase 4
