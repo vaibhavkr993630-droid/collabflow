@@ -3,9 +3,122 @@
 Persistent memory for this project across sessions. Read this first before touching code.
 
 ## Current Phase
-**Phase 8 — Hardening (partial): CI, structured logging, Sentry, full Docker Compose stack —
-complete and verified. Not yet done: Phase 7 (frontend) hasn't started; expanded test coverage
-beyond what already existed wasn't a focus this pass.**
+**Phase 7 — Frontend Build-Out: complete and verified.**
+
+## Status — Phase 7 (React + TypeScript Frontend)
+- [x] Vite + React 19 + TypeScript scaffold, Tailwind CSS v4 (via `@tailwindcss/vite`, no
+      postcss config needed), React Router, TanStack Query, React Hook Form + Zod, `@dnd-kit`,
+      axios. Node wasn't installed in this environment — installed portably to `~/.local/node`
+      (no sudo), same pattern already used for `gh` in Phase 1.
+- [x] `src/api/` — one module per backend resource, all going through a shared axios instance
+      (`src/api/client.ts`) with a response interceptor that refreshes an expired access token
+      and retries the original request once, coalescing concurrent 401s into a single in-flight
+      refresh call rather than firing one refresh per failed request.
+- [x] `src/auth/` — `AuthContext` (login/register/logout, session restore via `/api/auth/me` on
+      page load using a stored refresh token) + `ProtectedRoute`. Tokens live in `localStorage`,
+      not an httpOnly cookie — documented tradeoff, see Known Simplifications.
+- [x] `src/ws/useWebSocket.ts` — the one piece of this phase with real architectural weight (done
+      at High effort per the plan): generic reconnect/backoff hook. Exponential backoff (1s base,
+      ×2 per attempt, capped at 30s) with jitter, resets to 0 on successful open, and treats this
+      app's own 4401 auth-failure close code (see backend `core/deps.py`) differently — a higher
+      base delay, since retrying instantly with a token that was just rejected is more likely
+      hammering a dead session than catching one about to refresh. `getUrl()` is re-evaluated on
+      every reconnect attempt (not captured once) specifically so a reconnect after 4401 picks up
+      a token that may have been refreshed elsewhere in the meantime. Two consumer hooks
+      (`useProjectSocket`, `useNotificationSocket`) wrap it for the two backend WS endpoints.
+- [x] Kanban board (`KanbanBoard`/`KanbanColumn`/`TaskCard`, `@dnd-kit`) with optimistic status
+      updates on drop (instant UI feedback, rolled back via TanStack Query's `onError` if the
+      PATCH fails), live WS-driven invalidation on `task_created`/`task_updated`/`task_deleted`
+      from other clients, and live presence (`N online`, fed by `presence_snapshot`/
+      `presence_joined`/`presence_left` events, REST `/presence` as the pre-socket fallback).
+- [x] Task detail panel — inline-editable status/priority/due date/description, label toggles,
+      attachment upload/download(presigned URL)/delete, comments (with the `@email` mention
+      syntax surfaced in the placeholder), and the task's activity log — all on the same
+      invalidate-on-WS-event pattern as the board.
+- [x] Dashboard — organizations → workspaces → projects drill-down, URL-search-param-backed
+      (`?org=&workspace=`) so it's bookmarkable/shareable, with inline create forms at each level.
+- [x] Notifications panel — unread badge count, live WS updates, mark-read/mark-all-read, all via
+      TanStack Query invalidation off the notification WS event.
+- [x] Full browser verification, not just typecheck/build: installed Playwright (browsers +
+      missing system `.so` libs extracted from `apt-get download`'d `.deb`s into a local prefix
+      via `LD_LIBRARY_PATH` — no sudo available, see Bugs below) and drove the real app through
+      register → create org/workspace/project → Kanban board → **drag-and-drop between columns**
+      → task detail panel → add a comment → confirmed it persisted, all against the real running
+      backend + Postgres/Redis/MinIO, zero browser console errors. Screenshots confirm Tailwind
+      styling, the priority badges, and the activity log rendering correctly.
+- [x] Two new backend endpoints added to support the dashboard (`GET /api/organizations`,
+      `GET /api/organizations/{id}/workspaces`) — this project had no way to *list* a user's
+      organizations or the workspaces within one, only to create them or list workspace-scoped
+      members. Both request-tested (4 new backend tests) and exercised for real by the browser flow.
+- [x] Backend: 65/65 tests pass (61 + 4 new), ruff clean. Frontend: `tsc -b` clean, `oxlint` clean
+      (aside from two style warnings on intentional patterns — see below), production build succeeds.
+
+## Bugs found and fixed in Phase 7 (three, all only visible running the real thing)
+1. **The interesting one: `select(Organization).union(select(Organization)...)` silently returned
+   garbage.** The new `list_for_user` org-listing query used SQLAlchemy's `.union()` on two
+   ORM-entity `select()`s, then `.scalars().all()`. This does **not** preserve entity mapping —
+   the union collapses to a Core-level compound select, and `.scalars()` blindly took the first
+   *column* of each row rather than a full `Organization` object. In this table's column order,
+   that first column was `name`, so the endpoint returned a list of raw org-name strings instead
+   of org objects — caught immediately by FastAPI's response-model validation
+   (`ResponseValidationError: Input should be a valid dictionary or object`, input `'Acme'`) the
+   moment a test exercised the invited-member path, not the owner-only path (which happened to
+   only hit the `owned` half and looked fine in isolation). Fixed by running the two queries
+   separately and merging/deduplicating by id in Python — simpler, and sidesteps the ORM/Core
+   boundary issue entirely. **Lesson: `.union()` on ORM-entity selects is a real pitfall, not a
+   theoretical one — verify with a test that actually exercises the branch requiring the second
+   half of the union, not just the first.**
+2. **The Kanban board's task list silently never loaded.** The frontend requested
+   `page_size=200` when fetching all of a project's tasks for the board; the backend's task-list
+   endpoint caps `page_size` at 100 and rejects anything above it with a 422. Every board load hit
+   this and failed — invisible in the UI because `tasksQuery.data?.items ?? []` quietly rendered
+   an empty board instead of surfacing the error, so it *looked* like "no tasks yet" rather than
+   "broken." Only caught by watching real network responses during the Playwright flow, not by
+   any type-level check (both sides were "just numbers" as far as TypeScript/Pydantic were
+   concerned). Fixed by lowering the request to 100 (matching the backend's actual contract) and
+   — the more important fix — added an explicit `tasksQuery.isError` branch so a future contract
+   mismatch fails loudly in the UI instead of rendering an empty board that looks intentional.
+3. **Vite's dev server wasn't picking up file edits at all**, silently serving a stale bundle —
+   a just-applied fix (bug #2 above) kept reproducing identically on repeated Playwright runs
+   until this was noticed. Root cause: this project lives under `/mnt/d/...`, a Windows drive
+   mounted into WSL2, where native `fs.watch` doesn't reliably fire. No error, no warning — Vite
+   just never logged an HMR update for the changed file. Fixed with `server.watch.usePolling` in
+   `vite.config.ts`. **Lesson: on a WSL2 + Windows-mounted-drive setup, always suspect the file
+   watcher first if a fix "doesn't seem to take effect" — verify by checking for Vite's own HMR
+   log line, not just by re-testing and being confused when nothing changes.**
+
+## Known Simplifications (Phase 7)
+- Auth tokens in `localStorage`, not an httpOnly cookie — readable by any script running on the
+  origin (XSS risk), traded for a simpler backend contract (no cookie handling, no CSRF concerns
+  to manage alongside it). A production system would prefer httpOnly cookies for the refresh
+  token specifically.
+- No reconnect UI affordance (a toast/banner saying "reconnecting…") — the WS hook's `status` is
+  exposed but not yet wired into any visible indicator beyond the presence count implicitly going
+  stale. Small addition if wanted later.
+- Kanban board fetches up to 100 tasks in one page and does client-side column grouping/sorting —
+  fine at this project's scale, but a project with >100 tasks would silently only show the first
+  100 (page 1). Real pagination controls on the board itself are out of scope for now; the
+  underlying list endpoint already supports it (Phase 3), just not surfaced in this UI.
+- `oxlint` warnings on two intentional patterns left as-is rather than refactored around: the
+  "latest ref" pattern in `useWebSocket.ts` (writing, not reading, a ref during render to keep a
+  callback fresh for later use — a well-established React pattern despite the lint tool's
+  generic warning), and co-locating `useAuth()` with `AuthProvider` in one file (a fast-refresh
+  optimization warning, not a correctness issue).
+
+## Local dev environment notes (Phase 7 additions)
+- Node.js: not preinstalled in this environment — installed to `~/.local/node` (portable binary
+  tarball, no sudo), added to `PATH` via `.bashrc`, same pattern as the `gh` CLI in Phase 1.
+- Browser testing: Playwright + Chromium installed for verification, but `playwright install
+  --with-deps` needs sudo for ~26 system packages (fonts, `libnspr4`, `libnss3`, X11 libs, etc.)
+  that weren't available. Worked around with `apt-get download <pkg>` (no root needed to
+  *download* a `.deb`) + `dpkg-deb -x` to extract into a local prefix + `LD_LIBRARY_PATH` pointing
+  at it — fully userspace, no system changes. Not committed anywhere (it's session-local
+  verification tooling, not a project dependency); a future session hitting missing shared
+  libraries for headless Chromium should reach for this same trick rather than assuming it's blocked.
+
+## Status — Phase 8 (Hardening — CI, structured logging, Sentry, full Docker Compose stack)
+Complete and verified in the previous pass. Not yet done: expanded test coverage beyond what
+already existed wasn't a focus of that pass; CI doesn't publish the Docker image anywhere.
 
 ## Status — Phase 8 (Hardening, partial pass)
 Picked ahead of Phase 7 deliberately: 34 commits of working backend with zero CI was the bigger
@@ -463,22 +576,23 @@ their labels — a deliberate `selectinload`-equivalent choice, not an accident.
   -c "CREATE DATABASE collabflow_test;"`.
 
 ## Next Steps
-This Phase 8 pass is done and verified (CI, structured logging, Sentry, full Docker Compose
-stack). Remaining Phase 8 scope not yet touched: expanded test coverage beyond what already
-existed, and CI doesn't publish the Docker image anywhere. Next big piece: **Phase 7 (Frontend
-Build-Out)** — React + TypeScript, Kanban board, task detail panel, comments, notifications panel,
-WebSocket integration (with a reconnect/backoff wrapper — genuinely nontrivial, see Model Effort
-Reminder), protected routes. The backend API has been stable enough to build against since Phase 2.
+Both Phase 7 (Frontend) and this Phase 8 pass (CI, structured logging, Sentry, full Docker
+Compose) are done and verified — the whole build-order list in the brief is now covered end to
+end (auth → org/workspace/project → tasks → RBAC → activity/search → real-time → notifications →
+files → frontend → hardening), with a real browser-driven flow confirmed working against the real
+backend. Remaining known gaps, none blocking: Phase 8's expanded-test-coverage item and Docker
+image publishing from CI weren't touched; the frontend has no `frontend` service in
+`docker-compose.yml` yet (Phase 8's compose work predates the frontend existing); Phase 9
+(Deploy — Railway/Render + Vercel) hasn't started.
 
 ## Model Effort Reminder
 Per the brief: stay at Medium effort for routine CRUD/auth work; bump to High only for genuinely
-harder design problems. Phase 4 (Real-Time) was done at High and caught real concurrency bugs that
-Medium-effort review likely would have missed. Phases 5, 6, and this Phase 8 pass were all done at
-Medium, appropriately — CRUD-shaped or infra-wiring work (new models, a standard Celery setup, a
-standard S3-client wrapper, CI/logging/Docker config) with no comparable architectural complexity,
-even though this Phase 8 pass did catch three real bugs (see its bug list) — those were caught by
-actually running things against real infra, not by deeper reasoning about a hard design problem.
-**Bump to High when Phase 7's WebSocket client (reconnect/backoff logic, reconciling live events
-with React Query cache state) starts** — that's the one piece of frontend work with real
-architectural teeth, similar in kind to Phase 4's backend WebSocket work. Routine component/UI
-work in Phase 7 can stay at Medium.
+harder design problems. Phase 4 (Real-Time, backend) and Phase 7's WebSocket client
+(`useWebSocket.ts` — reconnect/backoff, reconciling live events with TanStack Query cache state)
+were both done at High, appropriately — the rest of Phase 7 (components, forms, the Kanban
+board's drag-and-drop wiring) stayed at Medium once that one piece was settled. Phases 5, 6, and
+8 were Medium throughout — CRUD-shaped or infra-wiring work, even though several of them still
+caught real bugs (see each phase's bug list) — those came from actually running things against
+real infra, not from harder reasoning about a hard design problem. **Stay at Medium going into
+Phase 9 (Deploy)** unless something about the production topology turns out to be a genuine
+design problem rather than a configuration one.

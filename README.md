@@ -9,7 +9,8 @@ for full scope, and [PROGRESS.md](PROGRESS.md) for build status and decisions.
 ## Stack
 
 Backend: FastAPI, async SQLAlchemy 2.0, PostgreSQL, Alembic, JWT auth, hand-rolled RBAC.
-Frontend: React + TypeScript (Phase 7+). Real-time: FastAPI WebSockets + Redis pub/sub.
+Frontend: React 19 + TypeScript, Vite, Tailwind CSS v4, TanStack Query, React Router,
+React Hook Form + Zod, `@dnd-kit`. Real-time: FastAPI WebSockets + Redis pub/sub.
 
 ## Real-time architecture
 
@@ -62,6 +63,35 @@ surface the way serving uploads back through the app server would be.
 
 MinIO's own console is at `http://localhost:9001` (login: the `S3_ACCESS_KEY`/`S3_SECRET_KEY`
 values in `.env`) if you want to browse the bucket directly.
+
+## Frontend
+
+`frontend/` is a Vite + React + TypeScript app. It's not yet in `docker-compose.yml` (that
+predates the frontend existing) — run it separately:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Serves on `http://localhost:5173`; Vite's dev proxy (`vite.config.ts`) forwards `/api` and `/ws`
+to the backend on `:8000`, so no CORS setup or `VITE_API_BASE_URL` is needed for local dev — that
+env var exists for production only, where the frontend and backend are on different domains.
+
+**WebSocket client** (`src/ws/useWebSocket.ts`) reconnects with exponential backoff (1s base,
+capped at 30s, with jitter), resetting to a fresh backoff schedule on every successful reconnect.
+It treats the backend's `4401` WS auth-failure close code specially (a higher base delay — retrying
+instantly with a token that was just rejected is more likely hammering a dead session than
+catching one about to refresh) and re-reads the current access token on every reconnect attempt
+rather than one captured at connect time, so a reconnect after a token refresh picks up the new
+one automatically.
+
+**A note on this repo's location under `/mnt/d/...`:** if you're on WSL2 with the project on a
+Windows-mounted drive, Vite's native file watcher may not pick up edits reliably (`vite.config.ts`
+already sets `server.watch.usePolling` for this reason — see PROGRESS.md's Phase 7 bug list for
+how this was discovered). If HMR ever seems to silently stop working, that's the first thing to
+suspect.
 
 ## Local development
 
