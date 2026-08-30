@@ -59,10 +59,20 @@ export default defineRailway(() => {
     // without verifying a custom domain — free tier restricts it to only
     // deliver to the account's own verified email, which is fine for a demo.
     SMTP_HOST: "smtp.resend.com",
-    SMTP_PORT: "587",
+    // 2587, not the standard 587: Railway blocks outbound 25/465/587 entirely
+    // (connection just times out — confirmed via a raw socket test from inside
+    // the worker container, not an SMTP-level rejection). Resend documents
+    // 2465/2587 as STARTTLS-equivalent alternates specifically for platforms
+    // that block the standard ports; this app's smtplib code (starttls() then
+    // login()) is already the right flow for either port, so only the port
+    // number needed to change.
+    SMTP_PORT: "2587",
     SMTP_FROM: "onboarding@resend.dev",
     SMTP_USER: "resend",
     SMTP_PASSWORD: preserve(),
+    // The Vercel-deployed frontend's origin — not a secret, just needs to
+    // match whatever domain the frontend actually deployed to.
+    CORS_ORIGINS: '["https://frontend-flame-sigma-2zv4mlpsy0.vercel.app"]',
   };
 
   const backendSource = github("vaibhavkr993630-droid/collabflow", {

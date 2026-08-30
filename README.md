@@ -2,6 +2,9 @@
 
 [![Backend CI](https://github.com/vaibhavkr993630-droid/collabflow/actions/workflows/backend-ci.yml/badge.svg)](https://github.com/vaibhavkr993630-droid/collabflow/actions/workflows/backend-ci.yml)
 
+**Live:** [frontend-flame-sigma-2zv4mlpsy0.vercel.app](https://frontend-flame-sigma-2zv4mlpsy0.vercel.app)
+· API docs: [backend-production-0338.up.railway.app/docs](https://backend-production-0338.up.railway.app/docs)
+
 A real-time collaboration and project management platform — a focused hybrid of Jira
 (task/project management) and Slack (real-time updates). See [PROJECT_BRIEF2.md](PROJECT_BRIEF2.md)
 for full scope, and [PROGRESS.md](PROGRESS.md) for build status and decisions.
@@ -146,3 +149,35 @@ Tests run against a separate `collabflow_test` database (see `TEST_DATABASE_URL`
 createdb collabflow_test   # or: docker exec -it <postgres-container> createdb -U collabflow collabflow_test
 pytest
 ```
+
+## Deployment
+
+Backend + Postgres + Redis + MinIO on **Railway**, frontend on **Vercel** — see PROGRESS.md's
+Phase 9 section for the full story (six real bugs found deploying this, each with what caught it).
+
+**Backend** (`.railway/railway.ts` — infrastructure-as-code, not clicked together by hand):
+
+```bash
+npm install railway               # the IaC file's TypeScript types
+railway config plan                # preview changes
+railway config apply --yes         # apply them
+railway ssh --service backend -- alembic upgrade head   # migrations, once per schema change
+```
+
+Secrets (`JWT_SECRET_KEY`, `SMTP_PASSWORD`, MinIO credentials) are never in that committed file —
+set directly with `railway variable set KEY=value --service <name> --skip-deploys`, then declared
+in `railway.ts` via `preserve()` so the next `config apply` doesn't treat them as drift and delete
+them (a real footgun hit once during setup — see PROGRESS.md). Backend and worker are GitHub-sourced,
+so a normal `git push` to `main` redeploys them automatically.
+
+**Frontend:**
+
+```bash
+cd frontend
+vercel deploy --prod --yes
+```
+
+Not connected to GitHub for auto-deploy (that handshake failed under token-only CLI auth) — every
+frontend change needs this command run by hand. `VITE_API_BASE_URL` is set via `vercel env add`
+to the Railway backend's public URL; without it, the app tries to call `/api` and `/ws` on its own
+Vercel origin, which has neither route (this exact bug shipped once — see PROGRESS.md).

@@ -3,7 +3,112 @@
 Persistent memory for this project across sessions. Read this first before touching code.
 
 ## Current Phase
-**Phase 7 — Frontend Build-Out: complete and verified.**
+**Phase 9 — Deploy: complete and verified. The project is live.**
+
+- Frontend (Vercel): https://frontend-flame-sigma-2zv4mlpsy0.vercel.app
+- Backend (Railway): https://backend-production-0338.up.railway.app (`/docs` for the OpenAPI UI,
+  `/health` for the DB/Redis-checked health endpoint)
+
+## Status — Phase 9 (Deploy)
+Backend + Postgres + Redis + MinIO on Railway, frontend on Vercel — per the brief. Both platforms
+needed the user's own accounts; browser-based OAuth login doesn't work in this tool environment,
+so auth went through each CLI's token/device-code flow instead (Railway: `railway login
+--browserless`, a device code the user completed in their own browser, same pattern as `gh auth
+login` in Phase 1. Vercel: a personal access token from vercel.com/account/tokens, since Vercel's
+interactive login menu needs a TTY this tool doesn't have).
+
+- [x] Railway project `collabflow` provisioned via **infrastructure-as-code**
+      (`.railway/railway.ts`, Railway's own IaC tool — `railway config plan`/`apply`), not
+      clicked together in the dashboard: Postgres, Redis, MinIO (persistent volume + public
+      domain for presigned attachment URLs), and a `backend` service, all built from
+      `backend/Dockerfile` via GitHub source (so a future `git push` to `main` auto-redeploys
+      backend/worker — confirmed working, see bug list). No secret literals anywhere in that
+      committed file — actual credential values are set directly via `railway variable set` and
+      referenced in the IaC file only via `preserve()` or Railway's `${{Service.VAR}}` syntax.
+- [x] Alembic migrations run against the real Railway Postgres via `railway ssh --service backend
+      -- alembic upgrade head` (SSH into the running container so `*.railway.internal` hostnames
+      resolve — they don't from outside Railway's network).
+- [x] Frontend deployed via `vercel deploy --prod` (project not connected to GitHub for
+      auto-deploy — that handshake failed under a token-only, non-interactive auth and wasn't
+      chased further; redeploying after a fix is a one-command `vercel deploy --prod` either way).
+      `VITE_API_BASE_URL` set to the Railway backend's public URL via `vercel env add`.
+- [x] Production email via Resend (free tier, user's own account) — `app/core/email.py` gained
+      STARTTLS + login support (the MailDev setup it was written for needs neither). Verified with
+      a real invite-notification email that actually arrived, not just "the API call returned 200."
+- [x] Full end-to-end verification against the *actual deployed* frontend+backend with a real
+      headless browser (not curl, not local dev) — register → org → workspace → project → Kanban
+      board → task creation, zero console errors on the final pass. Confirms CORS, the SPA
+      rewrite, and the WS-endpoint-targets-the-right-origin fix (see bug list) all actually work
+      together in production, not just individually.
+
+## Bugs found and fixed in Phase 9 (six — deployment is where "works on my machine" gets tested)
+1. **Railway's free tier caps services per project** — going from 3 (Postgres/Redis/MinIO) to 6
+   (+backend/worker/beat) failed with "Free plan resource provision limit exceeded." Fixed by
+   merging worker+beat into one service via Celery's `-B` embedded-beat flag — a legitimate
+   pattern for a single-worker deployment (the usual reason to keep them separate, multiple
+   worker replicas each firing their own copy of a scheduled job, doesn't apply when there's only
+   ever one worker process). Down to 5 services.
+2. **`networking.serviceDomains` in the IaC file silently didn't provision MinIO's public
+   domain** — `railway config apply` reported success, but `railway domain list --service minio`
+   came back empty. No error, no diagnostic. Worked around with the direct CLI command
+   (`railway domain --service minio --port 9000`) instead of the declarative field.
+3. **The interesting one: `railway config apply` treats any variable set via `railway variable
+   set` alone (not also declared in the IaC file) as undeclared drift, and the *next* `plan`
+   proposes deleting it.** Set `JWT_SECRET_KEY` this way, then ran `config plan` for an unrelated
+   change and saw "Delete variable backend.JWT_SECRET_KEY" staged — which would have wiped the
+   secret invalidating every session on the next `apply`. Fixed by declaring every out-of-band
+   secret in the IaC file via `preserve()` (a marker meaning "managed here, but keep whatever
+   value is already set — never overwrite or delete it") the moment it's set, not as an
+   afterthought. **Lesson: with this tool, `variable set` and declaring `preserve()` in the IaC
+   file are not independent steps — treat them as one atomic action, or the next `plan` becomes a
+   footgun.**
+4. **Celery's worker crash-looped on boot** — default prefork pool concurrency sizes itself off
+   the CPU count the container can *see*, which was 48 (the host node's full core count, not
+   anything actually available to a free-tier container). Forking that many worker processes
+   crashed the service repeatedly. Fixed with an explicit `--concurrency=2` — this app's task
+   volume (occasional emails, one daily reminder job) never needed real parallelism anyway.
+5. **Resend's email-sending Celery task hung indefinitely instead of failing** — no timeout on
+   the `smtplib.SMTP()` connection, and the actual cause turned out to be Railway blocking
+   outbound ports 25/465/587 entirely (confirmed with a raw `socket.create_connection` test via
+   `railway ssh` — a connection-level timeout, not an SMTP-level rejection, which is what made it
+   hang rather than error). Resend documents 2465/2587 as STARTTLS-equivalent alternates
+   specifically for platforms that block the standard ports; switching `SMTP_PORT` to `2587`
+   fixed it immediately (confirmed via worker logs: `succeeded in 1.27s`, and the email actually
+   arrived). **Lesson: a task that hangs rather than fails is almost always a network-reachability
+   problem, not an application bug — test raw socket connectivity before debugging the
+   protocol-level code.**
+6. **Two bugs only a real browser hitting the real deployed frontend would catch, both fixed in
+   one redeploy cycle each:**
+   - Vercel served a bare static build with no SPA fallback — direct navigation to `/register`
+     404'd (only `/` worked, since that's the one actual file in `dist/`). Client-side routing
+     (React Router) never got a chance to handle the path. Fixed with a `vercel.json` rewrite
+     (`/(.*) → /index.html`).
+   - The WebSocket hooks hardcoded `window.location.host` as the connection target — correct in
+     local dev only because Vite's dev proxy forwards `/ws` to the backend on the *same* origin
+     the page is served from. In production the frontend (Vercel) and backend (Railway) are
+     different domains with no proxy between them; every WS connection attempt silently tried
+     (and failed) to open a socket against the frontend's own static host, which has no `/ws`
+     route. Local testing and even a full production *HTTP* smoke test both missed this — it only
+     surfaced in the browser console. Fixed with a shared `wsBaseUrl()` helper that targets
+     `VITE_API_BASE_URL` when set, falling back to `window.location.host` only when it isn't
+     (local dev). Re-verified after the fix: zero console errors on the full flow.
+
+## Known Simplifications (Phase 9)
+- Vercel's project isn't connected to GitHub for auto-deploy — the connection attempt failed
+  under token-only non-interactive auth and wasn't chased further (Railway's GitHub-sourced
+  backend/worker auto-deploy on push and work fine; the frontend needs a manual `vercel deploy
+  --prod` per change for now).
+- MinIO runs as a single Railway service with a 500MB volume — no backups, no redundancy, and a
+  free-tier resource ceiling. Fine for a demo; a real production system would use managed S3 (or
+  R2, Backblaze B2) instead of self-hosting MinIO.
+- Resend's free tier (used for production email) only delivers to the account owner's own
+  verified email address without a verified custom sending domain — real invite/mention emails to
+  arbitrary users won't arrive in this deployment. In-app notifications (the WebSocket ones) are
+  unaffected and work for any user regardless.
+- No CI/CD gate before Railway's auto-deploy fires on push to `main` — the GitHub Actions
+  workflow (Phase 8) runs in parallel but doesn't block the Railway deploy from an untested commit.
+  Acceptable for a portfolio project's demo cadence; would need wiring (e.g. deploy from a
+  workflow step gated on tests passing) for anything closer to real production practice.
 
 ## Status — Phase 7 (React + TypeScript Frontend)
 - [x] Vite + React 19 + TypeScript scaffold, Tailwind CSS v4 (via `@tailwindcss/vite`, no
@@ -576,23 +681,21 @@ their labels — a deliberate `selectinload`-equivalent choice, not an accident.
   -c "CREATE DATABASE collabflow_test;"`.
 
 ## Next Steps
-Both Phase 7 (Frontend) and this Phase 8 pass (CI, structured logging, Sentry, full Docker
-Compose) are done and verified — the whole build-order list in the brief is now covered end to
-end (auth → org/workspace/project → tasks → RBAC → activity/search → real-time → notifications →
-files → frontend → hardening), with a real browser-driven flow confirmed working against the real
-backend. Remaining known gaps, none blocking: Phase 8's expanded-test-coverage item and Docker
-image publishing from CI weren't touched; the frontend has no `frontend` service in
-`docker-compose.yml` yet (Phase 8's compose work predates the frontend existing); Phase 9
-(Deploy — Railway/Render + Vercel) hasn't started.
+Every phase in the brief's build order is now done and verified, including deployment — the
+project is live at the URLs at the top of this file. Remaining known gaps, none blocking: Phase
+8's expanded-test-coverage item and Docker image publishing from CI weren't touched; Vercel isn't
+connected to GitHub for auto-deploy (manual `vercel deploy --prod` per frontend change); Resend's
+free tier only delivers real email to the account owner, not arbitrary invited users. From here,
+what's left is maintenance-mode: keep both deploys in sync with `main`, and pick up any of the
+Known Simplifications across phases if this ever needs to be more than a portfolio demo.
 
 ## Model Effort Reminder
 Per the brief: stay at Medium effort for routine CRUD/auth work; bump to High only for genuinely
 harder design problems. Phase 4 (Real-Time, backend) and Phase 7's WebSocket client
 (`useWebSocket.ts` — reconnect/backoff, reconciling live events with TanStack Query cache state)
-were both done at High, appropriately — the rest of Phase 7 (components, forms, the Kanban
-board's drag-and-drop wiring) stayed at Medium once that one piece was settled. Phases 5, 6, and
-8 were Medium throughout — CRUD-shaped or infra-wiring work, even though several of them still
-caught real bugs (see each phase's bug list) — those came from actually running things against
-real infra, not from harder reasoning about a hard design problem. **Stay at Medium going into
-Phase 9 (Deploy)** unless something about the production topology turns out to be a genuine
-design problem rather than a configuration one.
+were both done at High, appropriately. Phases 5, 6, 8, and 9 (Deploy) all stayed at Medium — none
+of them were hard *design* problems, even though several (9 especially) caught a lot of real bugs
+— those came from actually running things against real infra and a real browser, not from harder
+reasoning. Phase 9 in particular is a good example of the pattern this project keeps demonstrating:
+Medium effort plus rigorous verification (real browser, real deployed URLs, real socket tests over
+SSH) catches more real bugs than High effort spent reasoning about code that was never actually run.
